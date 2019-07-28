@@ -7,12 +7,15 @@ import json
 import urllib.request
 
 
+# This function just reads from httpbin.org the current IP
 def current_ip():
     ip = json.loads(urllib.request.urlopen('https://httpbin.org/ip').read())
     the_ip = ip['origin'].split(",")[0].strip()
     return the_ip
 
 
+# This class handles the communication with boto3 to reach the SG and enable/disable/view
+# It offers a very limited functionallity, but this is the one for the 90% of the cases
 class SgManager:
     def __init__(self, sg_id, protocol, list_of_ports):
         self.sg_id = sg_id
@@ -21,6 +24,21 @@ class SgManager:
         self.ec2 = boto3.client('ec2')
         self.current_cidr = current_ip()+"/32"
         print("Current IP is {}".format(self.current_cidr))
+
+    def _get_port_status(self):
+        active_ports = []
+        res  = {}
+        try:
+            res = self.ec2.describe_security_groups(GroupIds=[self.sg_id])
+        except ClientError as error:
+            print(error)
+            raise Exception("The Security group {} does not exists".format(self.sg_id))
+
+        for ingress in res['SecurityGroups'][0]['IpPermissions']:
+            active_ports.append(ingress['FromPort'])
+
+        print("Current active ports are {}".format(str(active_ports)))
+        return active_ports
 
     def read_sg(self):
         res = {}
@@ -36,14 +54,19 @@ class SgManager:
             print("0 permissions found")
         else:
             for ingress in res['SecurityGroups'][0]['IpPermissions']:
-                print("Protocol: {0[IpProtocol]} {0[FromPort]}:{0[ToPort]}".format(ingress))
+                print("{0[IpProtocol]:5} -> {0[FromPort]:5}:{0[ToPort]:5}".format(ingress))
                 for iprange in ingress['IpRanges']:
-                    print("{0[CidrIp]} {1}".format(iprange, iprange.get("Description", "")))
+                    print("    {0[CidrIp]:12}    {1:30}".format(iprange, iprange.get("Description", "")))
         return total_ingress
 
-    def _prepare_ip_permissions_command(self):
+    def _prepare_ip_permissions_command(self, verb):
         ip_permissions = []
+        current_active_ports = self._get_port_status()
         for port in self.ports:
+            if verb == "enable" and port in current_active_ports:
+                continue
+            if verb == "disable" and port not in current_active_ports:
+                continue
             ip_permissions.append(
                 {
                     "FromPort":     port,
@@ -60,25 +83,30 @@ class SgManager:
         return ip_permissions
 
     def enable_sg(self):
-        ip_permissions = self._prepare_ip_permissions_command()
-        res = self.ec2.authorize_security_group_ingress(
-            GroupId=self.sg_id,
-            IpPermissions = ip_permissions
-        )
+        ip_permissions = self._prepare_ip_permissions_command(verb="enable")
+        if len(ip_permissions):
+            res = self.ec2.authorize_security_group_ingress(
+                GroupId=self.sg_id,
+                IpPermissions = ip_permissions
+            )
+        else:
+            res = "no changes detected"
         return res
 
     def disable_sg(self):
-        ip_permissions = self._prepare_ip_permissions_command()
-        res = self.ec2.revoke_security_group_ingress(
-            GroupId=self.sg_id,
-            IpPermissions = ip_permissions
-        )
+        ip_permissions = self._prepare_ip_permissions_command(verb="disable")
+        if len(ip_permissions):
+            res = self.ec2.revoke_security_group_ingress(
+                GroupId=self.sg_id,
+                IpPermissions = ip_permissions
+            )
+        else:
+            res = "no changes detected"
         return res
 
     def action(self, verb):
-
         if verb == 'STATUS':
-            values = self.read_sg()
+            return self.read_sg()
 
         if verb == 'ENABLE':
             return self.enable_sg()
@@ -105,5 +133,5 @@ if __name__ == '__main__':
         boto3.setup_default_session(profile_name=args.profile)
 
     sm = SgManager(sg_id=args.sg, protocol=args.proto, list_of_ports=args.p)
-    sm.action(args.verb)
+    print(sm.action(args.verb))
 
